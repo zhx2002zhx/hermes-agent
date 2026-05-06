@@ -2,7 +2,7 @@
 """
 User Identity Mapper — Cross-channel memory unification for Hermes Agent.
 
-Solves: Same user on different channels (CLI, Telegram, Discord) gets
+Solves: Same user on different channels (CLI, Telegram, Feishu, Discord) gets
 separate memory banks. This script maps multiple chat_ids to a single
 user identity via symlinks, so memories are shared across channels.
 
@@ -99,8 +99,16 @@ def detect_owner_chat_id() -> tuple:
             home = tg.get('home_channel', '')
             if home:
                 chat_id = str(home).strip()
-                if chat_id.isdigit():
-                    return (chat_id, 'telegram', 'config.yaml home_channel')
+                if chat_id:
+                    return (chat_id, 'telegram', 'config.yaml telegram.home_channel')
+
+            # Check feishu config
+            feishu = config.get('platforms', {}).get('feishu', {})
+            home = feishu.get('home_channel', '')
+            if home:
+                chat_id = str(home).strip()
+                if chat_id:
+                    return (chat_id, 'feishu', 'config.yaml platforms.feishu.home_channel')
         except Exception:
             pass
     
@@ -144,8 +152,24 @@ def cmd_auto_setup():
     chat_id, platform, source = detect_owner_chat_id()
     
     if not chat_id:
+        # Fallback: try to detect from gateway log (last active platform sessions)
+        import re
+        log_path = Path.home() / ".hermes" / "logs" / "gateway.log"
+        if log_path.exists():
+            try:
+                content = log_path.read_text()
+                # Find most recent feishu and telegram DM chat_ids
+                feishu_ids = re.findall(r'feishu.*?chat[=:](\S+)', content)
+                tg_ids = re.findall(r'telegram.*?chat[=:](\d+)', content)
+                print("[DETECTED] Recent chat_ids from logs:")
+                print(f"  Feishu: {feishu_ids[-3:] if feishu_ids else 'none'}")
+                print(f"  Telegram: {tg_ids[-3:] if tg_ids else 'none'}")
+            except Exception:
+                pass
+
         print("[ERROR] Could not detect owner's chat_id.")
-        print("Please run manually: python3 user_mapper.py map --chat-id <ID> --user <name>")
+        print("Please run manually:")
+        print("  python3 user_mapper.py map --chat-id <ID> --user zhx2002zhx")
         return
     
     print(f"[DETECTED] Owner chat_id: {chat_id}")
@@ -266,6 +290,52 @@ def cmd_map(chat_id: str, user_id: str):
     save_mapping(mapping)
 
     print(f"[OK] chat_id {chat_id} → user '{user_id}'")
+
+
+
+
+def cmd_add_channel(chat_id: str, user_id: str):
+    """Add a channel (chat_id) to an existing user. Same as map but skips re-creation prompt."""
+    mapping = load_mapping()
+
+    # Check if chat_id already mapped
+    if chat_id in mapping and mapping[chat_id] == user_id:
+        print(f"[INFO] chat_id {chat_id} already mapped to user '{user_id}'")
+        return
+
+    # Check if chat_id mapped to different user
+    if chat_id in mapping and mapping[chat_id] != user_id:
+        print(f"[WARN] chat_id {chat_id} is already mapped to user '{mapping[chat_id]}'")
+        resp = input(f"Re-map to '{user_id}'? (y/N): ").strip().lower()
+        if resp != 'y':
+            print("Aborted.")
+            return
+        old_user = mapping[chat_id]
+        old_rev = f"_user_{old_user}_chat_ids"
+        if old_rev in mapping and chat_id in mapping[old_rev]:
+            mapping[old_rev].remove(chat_id)
+
+    udir = user_dir(user_id)
+    cdir = chat_dir(chat_id)
+
+    if not udir.exists():
+        print(f"[ERROR] User '{user_id}' does not exist. Run 'map' first to create the user.")
+        return
+
+    if cdir.exists() or cdir.is_symlink():
+        cdir.unlink()
+    cdir.symlink_to(udir)
+    print(f"[LINK] {cdir} → {udir}")
+
+    mapping[chat_id] = user_id
+    reverse_key = f"_user_{user_id}_chat_ids"
+    if reverse_key not in mapping:
+        mapping[reverse_key] = []
+    if chat_id not in mapping[reverse_key]:
+        mapping[reverse_key].append(chat_id)
+    save_mapping(mapping)
+
+    print(f"[OK] Added channel {chat_id} → user '{user_id}'")
 
 
 def cmd_unmap(chat_id: str):
@@ -424,6 +494,14 @@ if __name__ == "__main__":
         p.add_argument("--user", required=True)
         args = p.parse_args(sys.argv[2:])
         cmd_map(args.chat_id, args.user)
+
+    elif cmd == "add-channel":
+        import argparse
+        p = argparse.ArgumentParser(description="Add a channel to an existing user")
+        p.add_argument("--chat-id", required=True)
+        p.add_argument("--user", required=True)
+        args = p.parse_args(sys.argv[2:])
+        cmd_add_channel(args.chat_id, args.user)
 
     elif cmd == "unmap":
         import argparse
